@@ -78,31 +78,35 @@ function App() {
   const handleSignup = async (e) => {
     e.preventDefault();
 
-    const res = await fetch("http://localhost:5000/signup", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(formData),
-    });
-    const data = await res.json();
-    alert(data.message);
-  };
+  // ---------------- SIGNUP ----------------
+const res = await fetch("https://g-n-ration-ia-texte-image-ro0va0afo-ghofranes-projects-1148fb18.vercel.app/signup", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify(formData),
+});
+const data = await res.json();
+alert(data.message);
 
-  // ---------------- LOGIN ----------------
-  const handleLogin = async (e) => {
-    e.preventDefault();
+// ---------------- LOGIN ----------------
+const handleLogin = async (e) => {
+  e.preventDefault();
 
-    const res = await fetch("http://localhost:5000/login", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        email: formData.email,
-        password: formData.password,
-      }),
-    });
+  const res = await fetch("https://g-n-ration-ia-texte-image-ro0va0afo-ghofranes-projects-1148fb18.vercel.app/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      email: formData.email,
+      password: formData.password,
+    }),
+  });
+
+  const data = await res.json();
+  alert(data.message);
+};
 
     const data = await res.json();
 
