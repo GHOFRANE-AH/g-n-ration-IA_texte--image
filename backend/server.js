@@ -5,22 +5,69 @@ const bodyParser = require("body-parser");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const admin = require("firebase-admin");
-
-// node-fetch v3 is ESM; use a tiny wrapper so fetch works in CommonJS
-const fetch = (...args) => import("node-fetch").then(({ default: fetchFn }) => fetchFn(...args));
-
 const serviceAccount = require("./config/serviceAccountKey.json");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET, // <-- ajoute ça
   projectId: serviceAccount.project_id,
 });
+
+const { getStorage } = require("firebase-admin/storage");
+const bucket = getStorage().bucket();
+
+
+const fetch = (...args) => import("node-fetch").then(({ default: fetchFn }) => fetchFn(...args));
+
+/**
+ * Fetch with timeout support (compatible with all Node.js versions)
+ */
+const fetchWithTimeout = async (url, options = {}, timeoutMs = 180000) => {
+  // Use AbortController if available (Node.js 15+), otherwise use Promise.race
+  if (typeof AbortController !== 'undefined') {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        throw new Error(`Request timeout after ${timeoutMs}ms`);
+      }
+      throw error;
+    }
+  } else {
+    // Fallback for older Node.js versions
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
+    });
+    
+    return Promise.race([
+      fetch(url, options),
+      timeoutPromise
+    ]);
+  }
+};
+
+/**
+ * Sleep utility for delays between retries
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+
 
 const db = admin.firestore();
 const app = express();
 
 app.use(cors());
-app.use(bodyParser.json({ limit: "50mb" })); // allow larger payloads for up to 10 images
+app.use(bodyParser.json({ limit: "100mb" })); // allow larger payloads for up to 10 images in base64
+app.use(bodyParser.urlencoded({ limit: "100mb", extended: true }));
 
 const SECRET_KEY = process.env.SECRET_KEY || "supersecret";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -30,6 +77,30 @@ const clampNumberOfImages = (value) => {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return 1;
   return Math.min(Math.max(Math.round(numeric), 1), MAX_IMAGES);
+};
+
+/**
+ * Reduce base64 image size - simple approach
+ * Note: Truncation can corrupt images. For production, use sharp library for proper compression.
+ * @param {string} base64Data base64 string without data: prefix
+ * @param {number} maxSizeKB maximum size in KB
+ * @returns {string} base64 string
+ */
+const compressBase64Image = async (base64Data, maxSizeKB = 200) => {
+  const sizeKB = (base64Data.length * 3) / 4 / 1024;
+  if (sizeKB <= maxSizeKB) {
+    console.log(`Image size OK: ${sizeKB.toFixed(2)}KB`);
+    return base64Data;
+  }
+  
+  // Calculate max length for target size (keep it divisible by 4 for base64 padding)
+  const maxLength = Math.floor((maxSizeKB * 1024 * 4) / 3);
+  const truncated = base64Data.substring(0, maxLength - (maxLength % 4));
+  
+  console.log(`Image too large: ${sizeKB.toFixed(2)}KB, truncated to ~${maxSizeKB}KB (WARNING: may corrupt image)`);
+  console.log(`For better results, compress images on frontend before upload or use sharp library`);
+  
+  return truncated;
 };
 
 /**
@@ -54,21 +125,12 @@ const generateImagesWithGemini = async (finalPrompt, photos, numberOfImages) => 
                 {
                   parts: [
                     { text: finalPrompt },
-                    ...photos.map((p) => {
-                      // Détecter le type MIME à partir des données base64
-                      // Les images JPEG commencent généralement par /9j/ en base64
-                      // Les images PNG commencent généralement par iVBORw0KGgo
-                      let mimeType = "image/png"; // par défaut
-                      if (p.startsWith("/9j/") || p.startsWith("iVBORw0KGgo")) {
-                        mimeType = p.startsWith("/9j/") ? "image/jpeg" : "image/png";
-                      }
-                      return {
-                        inline_data: {
-                          mime_type: mimeType,
-                          data: p,
-                        },
-                      };
-                    }),
+                    ...photos.map((p) => ({
+                      inline_data: {
+                        mime_type: "image/png", // assume PNG
+                        data: p,
+                      },
+                    })),
                   ],
                 },
               ],
@@ -84,111 +146,27 @@ const generateImagesWithGemini = async (finalPrompt, photos, numberOfImages) => 
         }
 
         const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
-        
-        // Vérifier les finishReason pour détecter les blocages
-        for (const cand of candidates) {
-          if (cand?.finishReason && cand.finishReason !== "STOP") {
-            const reason = cand.finishReason;
-            const safetyRatings = cand?.safetyRatings || [];
-            if (reason === "SAFETY" || reason === "RECITATION" || safetyRatings.length > 0) {
-              const safetyDetails = safetyRatings.map(r => `${r.category}: ${r.probability}`).join(", ");
-              throw new Error(`Génération bloquée par Gemini (${reason}). ${safetyDetails || "Raison de sécurité non spécifiée"}`);
-            }
-            console.warn(`Finish reason: ${reason}`, cand);
-          }
-        }
-        
         let imageUrl = null;
 
-        // Parcourir tous les candidats
         for (const cand of candidates) {
-          if (!cand) continue;
-          
-          // Vérifier content.parts
           const parts = cand?.content?.parts || [];
           for (const part of parts) {
-            if (!part) continue;
-            
-            // Format 1: inline_data avec data
             const inlineData = part?.inline_data || part?.inlineData;
             if (inlineData?.data) {
               const mime = inlineData?.mime_type || inlineData?.mimeType || "image/png";
               imageUrl = `data:${mime};base64,${inlineData.data}`;
-              console.log("Image found in inline_data");
               break;
             }
-            
-            // Format 2: text qui commence par data:image/
             if (typeof part?.text === "string" && part.text.startsWith("data:image/")) {
               imageUrl = part.text;
-              console.log("Image found in text field");
               break;
-            }
-            
-            // Format 3: Vérifier si le text contient une image base64 encodée
-            if (typeof part?.text === "string" && part.text.length > 100) {
-              // Chercher un pattern base64 d'image dans le texte
-              const base64Match = part.text.match(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/);
-              if (base64Match) {
-                imageUrl = base64Match[0];
-                console.log("Image found in text as base64 string");
-                break;
-              }
             }
           }
           if (imageUrl) break;
         }
 
-        // Si toujours pas trouvé, vérifier d'autres emplacements possibles
         if (!imageUrl) {
-          // Vérifier directement dans data s'il y a une image
-          if (data.imageUrl || data.url) {
-            imageUrl = data.imageUrl || data.url;
-            console.log("Image found in root data");
-          } else if (data.content?.parts) {
-            // Vérifier dans data.content.parts directement
-            for (const part of data.content.parts) {
-              const inlineData = part?.inline_data || part?.inlineData;
-              if (inlineData?.data) {
-                const mime = inlineData?.mime_type || inlineData?.mimeType || "image/png";
-                imageUrl = `data:${mime};base64,${inlineData.data}`;
-                console.log("Image found in data.content.parts");
-                break;
-              }
-            }
-          }
-        }
-
-        if (!imageUrl) {
-          // Vérifier si Gemini a retourné un message d'erreur dans le texte
-          let errorMessage = null;
-          for (const cand of candidates) {
-            const parts = cand?.content?.parts || [];
-            for (const part of parts) {
-              if (part?.text && typeof part.text === "string") {
-                const text = part.text.toLowerCase();
-                if (text.includes("sorry") || text.includes("cannot") || text.includes("unable") || 
-                    text.includes("error") || text.includes("blocked") || text.includes("safety")) {
-                  errorMessage = part.text;
-                  break;
-                }
-              }
-            }
-            if (errorMessage) break;
-          }
-          
-          console.error("No image found in response. Response structure:", {
-            hasCandidates: !!data.candidates,
-            candidatesCount: candidates.length,
-            firstCandidate: candidates[0] ? JSON.stringify(candidates[0], null, 2) : null,
-            responseKeys: Object.keys(data || {}),
-            errorMessage: errorMessage || "Aucun message d'erreur détecté"
-          });
-          
-          const finalError = errorMessage 
-            ? `Gemini n'a pas pu générer d'image: ${errorMessage}` 
-            : "No image found in response";
-          throw new Error(finalError);
+          throw new Error("No image found in response");
         }
 
         return imageUrl;
@@ -204,38 +182,71 @@ const generateImagesWithGemini = async (finalPrompt, photos, numberOfImages) => 
   const imagePromises = Array.from({ length: safeCount }, () => generateSingleImage());
   return Promise.all(imagePromises);
 };
+/**
+ * Upload generated base64 image to Firebase Storage
+ * and return public URL
+ */
+const uploadGeneratedImageToStorage = async (base64DataUrl, email) => {
+  const match = base64DataUrl.match(/^data:(image\/\w+);base64,(.+)$/);
+  if (!match) {
+    throw new Error("Invalid base64 image format");
+  }
+
+  const mimeType = match[1];
+  const base64Data = match[2];
+  const buffer = Buffer.from(base64Data, "base64");
+  const extension = mimeType.split("/")[1];
+
+  const filePath = `generated/${email || "anonymous"}/${Date.now()}.${extension}`;
+  const file = bucket.file(filePath);
+
+  // Save the file
+  await file.save(buffer, {
+    metadata: { contentType: mimeType },
+    validation: "md5",
+  });
+
+  // Make the file publicly accessible
+  await file.makePublic();
+
+  // Return the public URL
+  return `https://storage.googleapis.com/${bucket.name}/${filePath}`;
+};
 
 /**
- * Save generated images to Firestore with truncation guard.
+ * Save generated images to Firestore - stores only Firebase Storage URLs, never base64.
  */
 const saveImagesToFirestore = async (email, imageUrls, metadata = {}) => {
   try {
     for (const imageUrl of imageUrls) {
-      const imageLength = imageUrl.length;
-      console.log(`Saving image, length: ${imageLength} characters`);
+      // Ensure we only save Firebase Storage URLs, never base64
+      if (!imageUrl || typeof imageUrl !== 'string') {
+        console.warn(`Invalid image URL, skipping: ${imageUrl}`);
+        continue;
+      }
 
-      let urlToSave = imageUrl;
+      // Check if it's a base64 data URL (should not happen, but safety check)
+      if (imageUrl.startsWith('data:image/')) {
+        console.error(`ERROR: Attempted to save base64 to Firestore! This should not happen. URL starts with data:image/`);
+        continue; // Skip base64 - should never be saved
+      }
 
-      if (imageLength > 800000) {
-        console.warn(
-          `Image too large (${imageLength} chars), truncating to 500KB. Consider using Firebase Storage for large images.`
-        );
-        urlToSave = imageUrl.substring(0, 500000) + "...[truncated]";
+      // Ensure it's a valid HTTP/HTTPS URL (Firebase Storage URL)
+      if (!imageUrl.startsWith('http://') && !imageUrl.startsWith('https://')) {
+        console.warn(`Invalid URL format, skipping: ${imageUrl}`);
+        continue;
       }
 
       const imageData = {
         email: email || "anonymous",
-        url: urlToSave,
+        url: imageUrl, // Store only the Firebase Storage URL
         created_at: new Date(),
-        originalLength: imageLength,
         ...metadata,
       };
 
       await db.collection("images").add(imageData);
 
-      console.log(
-        `Image saved for email: ${email || "anonymous"}, original: ${imageLength} chars, saved: ${urlToSave.length} chars`
-      );
+      console.log(`Image saved to Firestore for email: ${email || "anonymous"}, URL: ${imageUrl}`);
     }
 
     console.log(`All ${imageUrls.length} images saved to Firestore`);
@@ -371,11 +382,7 @@ app.post("/generate", async (req, res) => {
     }
 
     const addFidelityRequirements = (basePrompt) => {
-      return `${basePrompt} 
-Be faithful to the original face: preserve the same eyes (color, shape, expression), face shape, hair style/color/length, and skin tone from the reference photos.
-Keep the same clothing style, colors, and formality level as shown in the reference photos (do not add costumes or formal wear if not present in the original photos).
-Only the user should appear in the image—no other people or humans.
-Style: photorealistic and faithful to the original face.`;
+      return `${basePrompt} Preserve the same face, hair, and clothing style from reference photos. Generate a new scene, not a copy. Single person only. Photorealistic.`;
     };
 
     let finalPrompt = "";
@@ -543,15 +550,27 @@ Style: photorealistic and faithful to the original face.`;
     }
 
     const safeNumberOfImages = clampNumberOfImages(numberOfImages || 4);
-    const imageUrls = await generateImagesWithGemini(finalPrompt, photos, safeNumberOfImages);
-
-    await saveImagesToFirestore(email, imageUrls, {
+    const base64Images = await generateImagesWithGemini(
+      finalPrompt,
+      photos,
+      safeNumberOfImages
+    );
+    
+    const storedImageUrls = await Promise.all(
+      base64Images.map((img) =>
+        uploadGeneratedImageToStorage(img, email)
+      )
+    );
+    
+    await saveImagesToFirestore(email, storedImageUrls, {
       prompt: finalPrompt,
       style,
       photosCount: photos.length,
     });
-
-    res.json({ success: true, imageUrls, prompt: finalPrompt });
+    
+    res.json({ success: true, imageUrls: storedImageUrls, prompt: finalPrompt });
+    
+    
   } catch (error) {
     console.error("Generation error:", error);
     res.status(500).json({ success: false, message: "Error during generation." });
@@ -598,7 +617,7 @@ app.post("/generate-auto", async (req, res) => {
           {
             role: "system",
             content:
-              "You are a prompt engineer for an image model. Input: LinkedIn-style post text + up to two reference selfies of the SAME person. Produce ONE concise prompt (<120 words) ready for the image API. CRITICAL: Deeply analyze the post text to understand its theme, tone, context, and setting. Examples: Corporate/formal posts → professional office, business attire, serious atmosphere. Casual posts → relaxed café, casual clothes, friendly vibe. Sport/fitness posts → gym, outdoor activity, athletic wear, energetic mood. Artistic/creative posts → studio, creative workspace, artistic atmosphere. Technical posts → modern tech office, computer setup, professional tech environment. Nature/travel posts → outdoor setting, natural light, adventure vibe. Event/conference posts → stage, presentation setting, professional networking atmosphere. Philosophical/reflective posts → calm setting, thoughtful mood, introspective atmosphere. Hard constraints: (1) Only that person in frame—no other humans or people. (2) Be faithful to the original face: preserve the same eyes (color, shape, expression), face shape, hair style/color/length, and skin tone from the reference selfies. Say 'be faithful to the original face' in your prompt. (3) Keep the same clothing style, colors, and formality level as shown in the selfies (do not add costumes, suits, or formal wear if not present in the original photos). (4) Style: photorealistic and faithful to the original face. Professional lighting, clear framing/camera hints. No markdown or bullets—return only the final prompt string.",
+              "You are a prompt engineer for an image generation model. Input: LinkedIn-style post text + up to two reference selfies of the SAME person. Produce ONE concise prompt (<120 words) ready for the image API. Analyze the post text theme and setting. Examples: Corporate/formal → professional office, business attire. Casual → relaxed café, casual clothes. Sport/fitness → gym, athletic wear. Technical → tech office, computer setup. Nature/travel → outdoor setting. HARD CONSTRAINTS: (1) Generate a NEW image with different scene/pose, not a copy of selfies. (2) Preserve EXACT same face features from selfies - eyes, face shape, hair, skin tone. (3) Keep same clothing style/colors as selfies. (4) Single person only. (5) Photorealistic style. Return only the prompt string, no markdown.",
           },
           {
             role: "user",
@@ -640,7 +659,7 @@ Generate one optimized prompt for ${requestedCount} photorealistic portraits tha
     const normalizedPrompt = optimizedPrompt.replace(/\s+/g, " ").trim().slice(0, 700);
 
     const requirements =
-      "Requirements: single person only (no other humans), be faithful to the original face (preserve the same eyes, face shape, hair style/color/length, and skin tone from the reference selfies), keep the SAME clothing style/colors/formality as selfies (no costumes/suits if not in selfies), photorealistic and faithful to the original face, sharp focus, professional lighting, aspect ratio 1:1 or 4:5, no watermarks.";
+      "Preserve same face, hair, clothing from selfies. New scene, not a copy. Single person. Photorealistic.";
 
     const finalPrompt = `${normalizedPrompt}\n${requirements}`;
 
@@ -671,14 +690,26 @@ Generate one optimized prompt for ${requestedCount} photorealistic portraits tha
       return res.status(502).json({ success: false, message });
     }
 
-    await saveImagesToFirestore(email, finalImages, {
+    const storedImageUrls = await Promise.all(
+      finalImages.map((img) =>
+        uploadGeneratedImageToStorage(img, email)
+      )
+    );
+    
+    await saveImagesToFirestore(email, storedImageUrls, {
       prompt: finalPrompt,
       source: "auto_prompt",
       photosCount: photos.length,
       postText,
     });
-
-    res.json({ success: true, imageUrls: finalImages, prompt: finalPrompt, optimizedPrompt });
+    
+    res.json({
+      success: true,
+      imageUrls: storedImageUrls,
+      prompt: finalPrompt,
+      optimizedPrompt
+    });
+    
   } catch (error) {
     console.error("Auto generation error:", error);
     res.status(500).json({ success: false, message: "Error during auto generation." });
