@@ -95,6 +95,7 @@ function App() {
   const handleLogin = async (e) => {
     e.preventDefault();
 
+    console.log("Backend URL:", BACKEND_URL); // Debug log
     const res = await fetch(`${BACKEND_URL}/login`, {
       method: "POST",
       headers: {

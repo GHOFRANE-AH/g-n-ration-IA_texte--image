@@ -5,15 +5,50 @@ const bodyParser = require("body-parser");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const admin = require("firebase-admin");
-const serviceAccount = require("./config/serviceAccountKey.json");
 
+// Initialize Firebase Admin - support both JSON file and environment variables
+let serviceAccount;
+try {
+  // Try to load from file (for local development)
+  serviceAccount = require("./config/serviceAccountKey.json");
+  console.log("Firebase: Using service account from file");
+} catch (error) {
+  // On Vercel, use environment variables
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+      console.log("Firebase: Using service account from environment variable");
+    } catch (parseError) {
+      console.error("Failed to parse FIREBASE_SERVICE_ACCOUNT:", parseError);
+    }
+  }
+}
 
+if (!serviceAccount) {
+  console.error("Firebase service account not found. Please set FIREBASE_SERVICE_ACCOUNT environment variable or provide config/serviceAccountKey.json");
+}
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET, // <-- ajoute ça
-  projectId: serviceAccount.project_id,
-});
+const firebaseConfig = {
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+  projectId: serviceAccount?.project_id || process.env.FIREBASE_PROJECT_ID,
+};
+
+try {
+  if (serviceAccount) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      ...firebaseConfig,
+    });
+    console.log("Firebase Admin initialized successfully");
+  } else {
+    // Fallback: try to initialize with default credentials (for Vercel with env vars)
+    admin.initializeApp(firebaseConfig);
+    console.log("Firebase Admin initialized with default credentials");
+  }
+} catch (error) {
+  console.error("Failed to initialize Firebase Admin:", error.message);
+  // Don't throw - let the app start but API calls will fail
+}
 
 
 
@@ -865,9 +900,14 @@ app.delete("/image/:imageId", async (req, res) => {
   }
 });
 
-// ---------------------- START SERVER ----------------------
-const PORT = process.env.PORT || 5000;
+// ---------------------- EXPORT FOR VERCEL ----------------------
+// For Vercel serverless functions, export the app instead of listening
+module.exports = app;
 
-app.listen(PORT, () => {
-  console.log(`Backend running at http://localhost:${PORT}`);
-});
+// For local development, still allow app.listen
+if (require.main === module) {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => {
+    console.log(`Backend running at http://localhost:${PORT}`);
+  });
+}
