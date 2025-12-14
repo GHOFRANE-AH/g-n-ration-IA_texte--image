@@ -1,6 +1,8 @@
 import React, { useState } from "react";
 import "./App.css";
 
+const BACKEND_URL = "https://g-n-ration-ia-texte-image.vercel.app";
+
 function App() {
   const [mode, setMode] = useState("login");
   const [formData, setFormData] = useState({
@@ -78,7 +80,7 @@ function App() {
   const handleSignup = async (e) => {
     e.preventDefault();
 
-    const res = await fetch("http://localhost:5000/signup", {
+    const res = await fetch(`${BACKEND_URL}/signup`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -93,7 +95,7 @@ function App() {
   const handleLogin = async (e) => {
     e.preventDefault();
 
-    const res = await fetch("http://localhost:5000/login", {
+    const res = await fetch(`${BACKEND_URL}/login`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -214,7 +216,7 @@ function App() {
               numberOfImages: desiredCount,
             };
 
-      const res = await fetch(`http://localhost:5000/${endpoint}`, {
+      const res = await fetch(`${BACKEND_URL}/${endpoint}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -270,7 +272,7 @@ function App() {
     const selectedUrl = images[selectedImageIndex];
 
     try {
-      const res = await fetch("http://localhost:5000/selection", {
+      const res = await fetch(`${BACKEND_URL}/selection`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -322,7 +324,7 @@ function App() {
       return;
     }
 
-    const res = await fetch(`http://localhost:5000/delete/${user.email}`, {
+    const res = await fetch(`${BACKEND_URL}/delete/${user.email}`, {
       method: "DELETE",
       headers: {
         Authorization: `Bearer ${token}`,

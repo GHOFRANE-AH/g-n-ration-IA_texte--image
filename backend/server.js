@@ -7,11 +7,15 @@ const jwt = require("jsonwebtoken");
 const admin = require("firebase-admin");
 const serviceAccount = require("./config/serviceAccountKey.json");
 
+
+
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   storageBucket: process.env.FIREBASE_STORAGE_BUCKET, // <-- ajoute ça
   projectId: serviceAccount.project_id,
 });
+
+
 
 const { getStorage } = require("firebase-admin/storage");
 const bucket = getStorage().bucket();
@@ -65,7 +69,11 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const db = admin.firestore();
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: "https://stage-ghofrane.web.app", // ton front-end
+  methods: ["GET", "POST", "DELETE", "PUT"],
+  credentials: true
+}));
 app.use(bodyParser.json({ limit: "100mb" })); // allow larger payloads for up to 10 images in base64
 app.use(bodyParser.urlencoded({ limit: "100mb", extended: true }));
 
