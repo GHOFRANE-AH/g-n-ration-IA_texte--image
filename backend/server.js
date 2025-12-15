@@ -7,7 +7,10 @@ const jwt = require("jsonwebtoken");
 const admin = require("firebase-admin");
 // node-fetch v3 is ESM; use a tiny wrapper so fetch works in CommonJS
 const fetch = (...args) => import("node-fetch").then(({ default: fetchFn }) => fetchFn(...args));
-const serviceAccount = require("./config/serviceAccountKey.json");
+//const serviceAccount = require("./config/serviceAccountKey.json");
+
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -1526,7 +1529,7 @@ app.post("/tag/batch", async (req, res) => {
             const imgBuffer = Buffer.from(imgArrayBuffer);
             const base64Image = imgBuffer.toString("base64");
 
-            // Utiliser GPT-4 Vision pour analyser l'image (priorité aux visages)
+            // Utiliser GPT-4 Vision pour analyser l'image avec un prompt très détaillé
             const analysisRes = await fetch("https://api.openai.com/v1/chat/completions", {
               method: "POST",
               headers: {
@@ -1541,7 +1544,33 @@ app.post("/tag/batch", async (req, res) => {
                     content: [
                       {
                         type: "text",
-                        text: "Analyse cette image en détail. PRIORITÉ: Détecte si l'image contient un VISAGE ou une PERSONNE. Génère une liste de tags pertinents en priorisant: visage, portrait, personne, selfie, photo_profil si applicable, puis bureau, produit, ambiance, etc. Détermine aussi le contexte (indoor/outdoor, formel/casual, ambiance, action). Réponds UNIQUEMENT en JSON valide: {\"tags\": [\"visage\", \"portrait\", ...], \"context\": {\"location\": \"indoor/outdoor\", \"formality\": \"formel/casual\", \"ambiance\": \"description\", \"action\": \"description\", \"hasFace\": true/false}}",
+                        text: `Analyse cette image en DÉTAIL et génère des tags SPÉCIFIQUES et UNIQUES basés sur le contenu réel de l'image. 
+
+INSTRUCTIONS:
+1. Décris précisément ce que tu vois dans l'image (personne, objet, lieu, action, style, couleurs, ambiance)
+2. Génère 5-10 tags SPÉCIFIQUES et VARIÉS (pas génériques) basés sur:
+   - Le contenu principal (visage, bureau, produit, événement, nature, etc.)
+   - Le style (formel, casual, créatif, professionnel, décontracté, etc.)
+   - Le contexte (bureau, extérieur, studio, café, événement, etc.)
+   - L'ambiance (sérieux, joyeux, inspirant, technique, etc.)
+   - Les détails visuels (couleurs dominantes, éclairage, composition)
+3. Chaque image doit avoir des tags DIFFÉRENTS selon son contenu réel
+4. Évite les tags génériques comme "image" ou "photo"
+
+Exemples de tags spécifiques: "visage_souriant", "bureau_moderne", "événement_networking", "portrait_professionnel", "selfie_casual", "produit_tech", "équipe_travail", "conférence_scène", "nature_paysage", "café_détente", etc.
+
+Réponds UNIQUEMENT en JSON valide:
+{
+  "tags": ["tag1", "tag2", "tag3", ...],
+  "context": {
+    "location": "indoor/outdoor/studio/événement/etc",
+    "formality": "formel/casual/mixte",
+    "ambiance": "description précise de l'ambiance",
+    "action": "description de l'action ou pose",
+    "hasFace": true/false,
+    "mainSubject": "description du sujet principal"
+  }
+}`,
                       },
                       {
                         type: "image_url",
@@ -1552,21 +1581,39 @@ app.post("/tag/batch", async (req, res) => {
                     ],
                   },
                 ],
-                max_tokens: 400,
+                temperature: 0.8, // Plus de créativité pour des tags variés
+                max_tokens: 500,
               }),
             });
 
             const analysisData = await analysisRes.json();
             const analysisText = analysisData?.choices?.[0]?.message?.content || "";
 
-            // Parser la réponse JSON
+            // Parser la réponse JSON (gérer les cas où il y a du texte avant/après le JSON)
             try {
-              const parsed = JSON.parse(analysisText);
-              tags = parsed.tags || [];
+              // Extraire le JSON même s'il y a du texte autour
+              let jsonText = analysisText.trim();
+              
+              // Chercher le JSON entre accolades
+              const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+              if (jsonMatch) {
+                jsonText = jsonMatch[0];
+              }
+              
+              const parsed = JSON.parse(jsonText);
+              tags = Array.isArray(parsed.tags) ? parsed.tags : [];
               context = parsed.context || {};
               
-              // Si un visage est détecté, s'assurer que "visage" est dans les tags
-              if (parsed.hasFace && !tags.some(t => t.toLowerCase().includes("visage") || t.toLowerCase().includes("face"))) {
+              // S'assurer qu'on a au moins quelques tags
+              if (tags.length === 0) {
+                tags = ["visage", "portrait", "professionnel"];
+              }
+              
+              // Si un visage est détecté, s'assurer qu'un tag de visage est présent
+              if (parsed.hasFace && !tags.some(t => {
+                const lower = t.toLowerCase();
+                return lower.includes("visage") || lower.includes("face") || lower.includes("portrait") || lower.includes("personne");
+              })) {
                 tags.unshift("visage");
               }
               
@@ -1578,9 +1625,20 @@ app.post("/tag/batch", async (req, res) => {
                 if (!aIsFace && bIsFace) return 1;
                 return 0;
               });
-            } catch {
-              // Fallback: extraction simple avec priorité visage
-              tags = ["visage", "portrait", "professionnel"];
+              
+              console.log(`✅ Tags générés pour image ${imageId}: ${tags.join(", ")}`);
+            } catch (parseErr) {
+              console.error(`Erreur parsing JSON pour image ${imageId}:`, parseErr);
+              console.log(`Texte reçu: ${analysisText.substring(0, 200)}...`);
+              // Fallback: tags variés selon l'index pour éviter la répétition
+              const fallbackTags = [
+                ["visage", "portrait", "professionnel", "bureau"],
+                ["visage", "souriant", "casual", "détente"],
+                ["portrait", "formel", "bureau", "travail"],
+                ["visage", "équipe", "collaboration", "bureau"],
+                ["portrait", "événement", "networking", "professionnel"],
+              ];
+              tags = fallbackTags[imageIds.indexOf(imageId) % fallbackTags.length];
               context = { location: "indoor", formality: "formel", ambiance: "neutre", hasFace: true };
             }
           } catch (err) {
@@ -1637,7 +1695,7 @@ app.post("/post/analyze", async (req, res) => {
       return res.status(500).json({ success: false, message: "OPENAI_API_KEY non configurée." });
     }
 
-    // Analyser le post avec OpenAI
+    // Analyser le post avec OpenAI - prompt amélioré pour plus de précision
     const analysisRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -1649,15 +1707,41 @@ app.post("/post/analyze", async (req, res) => {
         messages: [
           {
             role: "system",
-            content: "Tu es un expert en analyse de contenu LinkedIn. Analyse le texte du post et détermine: les thèmes principaux, la tonalité (formel, casual, inspirant, etc.), le contexte (bureau, événement, extérieur, etc.), et les tags d'images désirés (visage, bureau, produit, ambiance, etc.). Réponds en JSON: {\"themes\": [\"theme1\", \"theme2\"], \"tone\": \"tonalité\", \"context\": \"description\", \"desiredTags\": [\"tag1\", \"tag2\"]}",
+            content: `Tu es un expert en analyse de contenu LinkedIn et en sélection d'images. 
+
+Analyse le texte du post en DÉTAIL et détermine:
+1. Les THÈMES PRINCIPAUX (3-5 thèmes spécifiques, pas génériques)
+   - Exemples: "entrepreneuriat", "formation", "événement", "témoignage", "conseil", "innovation", etc.
+   - Évite les thèmes trop génériques comme "professionnel" ou "contenu"
+
+2. La TONALITÉ précise (pas juste "neutre")
+   - Exemples: "inspirant", "pédagogique", "motivant", "formel", "décontracté", "enthousiaste", "réfléchi", etc.
+
+3. Le CONTEXTE spécifique
+   - Exemples: "bureau moderne", "événement networking", "café détente", "studio photo", "extérieur nature", "conférence scène", etc.
+
+4. Les TAGS D'IMAGES DÉSIRÉS (5-8 tags spécifiques)
+   - Basés sur le contenu réel du post
+   - Exemples: "visage_souriant", "bureau_travail", "événement_scène", "équipe_collaboration", "portrait_professionnel", etc.
+   - Chaque post doit avoir des tags DIFFÉRENTS selon son contenu
+
+IMPORTANT: Analyse le contenu RÉEL du post, pas des valeurs par défaut. Chaque post est unique.
+
+Réponds UNIQUEMENT en JSON valide:
+{
+  "themes": ["theme1", "theme2", ...],
+  "tone": "tonalité précise",
+  "context": "description précise du contexte",
+  "desiredTags": ["tag1", "tag2", ...]
+}`,
           },
           {
             role: "user",
-            content: `Analyse ce post LinkedIn:\n\n${postText}`,
+            content: `Analyse ce post LinkedIn en détail et génère une analyse SPÉCIFIQUE basée sur son contenu réel:\n\n"""${postText}"""\n\nGénère des thèmes, une tonalité, un contexte et des tags d'images qui correspondent PRÉCISÉMENT au contenu de ce post, pas des valeurs génériques.`,
           },
         ],
-        temperature: 0.7,
-        max_tokens: 500,
+        temperature: 0.8, // Plus de créativité pour des analyses variées
+        max_tokens: 600,
       }),
     });
 
@@ -1666,14 +1750,56 @@ app.post("/post/analyze", async (req, res) => {
 
     let analysis = {};
     try {
-      analysis = JSON.parse(analysisText);
-    } catch {
-      // Fallback si pas de JSON valide
+      // Extraire le JSON même s'il y a du texte autour
+      let jsonText = analysisText.trim();
+      const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        jsonText = jsonMatch[0];
+      }
+      analysis = JSON.parse(jsonText);
+      
+      // Valider et nettoyer les données
+      if (!Array.isArray(analysis.themes)) {
+        analysis.themes = ["professionnel", "contenu"];
+      }
+      if (!analysis.tone || analysis.tone === "neutre") {
+        // Essayer de déterminer la tonalité depuis le texte
+        const lowerText = postText.toLowerCase();
+        if (lowerText.includes("🔥") || lowerText.includes("excit") || lowerText.includes("fantast")) {
+          analysis.tone = "enthousiaste";
+        } else if (lowerText.includes("merci") || lowerText.includes("remerci")) {
+          analysis.tone = "reconnaissant";
+        } else if (lowerText.includes("conseil") || lowerText.includes("astuce")) {
+          analysis.tone = "pédagogique";
+        } else {
+          analysis.tone = "professionnel";
+        }
+      }
+      if (!analysis.context) {
+        analysis.context = "bureau";
+      }
+      if (!Array.isArray(analysis.desiredTags) || analysis.desiredTags.length === 0) {
+        analysis.desiredTags = ["visage", "portrait", "professionnel"];
+      }
+      
+      console.log(`✅ Analyse du post: thèmes=${analysis.themes.join(", ")}, tonalité=${analysis.tone}, tags=${analysis.desiredTags.join(", ")}`);
+    } catch (parseErr) {
+      console.error("Erreur parsing JSON analyse post:", parseErr);
+      console.log(`Texte reçu: ${analysisText.substring(0, 300)}...`);
+      // Fallback avec analyse basique du texte
+      const lowerText = postText.toLowerCase();
+      const themes = [];
+      if (lowerText.includes("événement") || lowerText.includes("event")) themes.push("événement");
+      if (lowerText.includes("formation") || lowerText.includes("atelier")) themes.push("formation");
+      if (lowerText.includes("conseil") || lowerText.includes("astuce")) themes.push("conseil");
+      if (lowerText.includes("témoignage") || lowerText.includes("avis")) themes.push("témoignage");
+      if (themes.length === 0) themes.push("professionnel");
+      
       analysis = {
-        themes: ["professionnel", "contenu"],
-        tone: "neutre",
-        context: "bureau",
-        desiredTags: ["visage", "portrait"],
+        themes: themes,
+        tone: lowerText.includes("🔥") ? "enthousiaste" : "professionnel",
+        context: lowerText.includes("événement") ? "événement" : "bureau",
+        desiredTags: ["visage", "portrait", "professionnel"],
       };
     }
 
@@ -1711,47 +1837,77 @@ app.post("/select", async (req, res) => {
 
     const userEmail = email || "anonymous";
 
-    // 1. Analyser le post pour obtenir les tags désirés
+    // 1. Récupérer l'analyse du post la plus récente ou analyser si nécessaire
     let desiredTags = [];
-    if (process.env.OPENAI_API_KEY) {
-      try {
-        const analysisRes = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: OPENAI_MODEL,
-            messages: [
-              {
-                role: "system",
-                content: "Extrais les tags d'images désirés de ce post LinkedIn. Réponds uniquement avec une liste JSON de tags: [\"tag1\", \"tag2\"]",
-              },
-              {
-                role: "user",
-                content: postText,
-              },
-            ],
-            temperature: 0.5,
-            max_tokens: 200,
-          }),
-        });
-
-        const analysisData = await analysisRes.json();
-        const tagsText = analysisData?.choices?.[0]?.message?.content || "";
+    
+    try {
+      // Chercher la dernière analyse pour ce post
+      const analysisSnapshot = await db.collection("posts_analysis")
+        .where("email", "==", userEmail)
+        .where("postText", "==", postText)
+        .orderBy("created_at", "desc")
+        .limit(1)
+        .get();
+      
+      if (!analysisSnapshot.empty) {
+        const latestAnalysis = analysisSnapshot.docs[0].data();
+        desiredTags = latestAnalysis.desiredTags || [];
+        console.log(`✅ Utilisation de l'analyse existante avec ${desiredTags.length} tags`);
+      }
+    } catch (err) {
+      console.log("⚠️ Impossible de récupérer l'analyse existante, extraction des tags...");
+    }
+    
+    // Si pas d'analyse trouvée, extraire les tags depuis le post
+    if (desiredTags.length === 0) {
+      if (process.env.OPENAI_API_KEY) {
         try {
-          desiredTags = JSON.parse(tagsText);
-        } catch {
+          const analysisRes = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: OPENAI_MODEL,
+              messages: [
+                {
+                  role: "system",
+                  content: "Extrais les tags d'images désirés de ce post LinkedIn. Réponds uniquement avec une liste JSON de tags: [\"tag1\", \"tag2\"]",
+                },
+                {
+                  role: "user",
+                  content: postText,
+                },
+              ],
+              temperature: 0.5,
+              max_tokens: 200,
+            }),
+          });
+
+          const analysisData = await analysisRes.json();
+          const tagsText = analysisData?.choices?.[0]?.message?.content || "";
+          try {
+            // Extraire le JSON même s'il y a du texte autour
+            let jsonText = tagsText.trim();
+            const jsonMatch = jsonText.match(/\[[\s\S]*\]/);
+            if (jsonMatch) {
+              jsonText = jsonMatch[0];
+            }
+            desiredTags = JSON.parse(jsonText);
+          } catch {
+            desiredTags = ["visage", "portrait", "professionnel"];
+          }
+        } catch (err) {
+          console.error("Erreur extraction tags:", err);
           desiredTags = ["visage", "portrait", "professionnel"];
         }
-      } catch (err) {
-        console.error("Erreur extraction tags:", err);
+      } else {
         desiredTags = ["visage", "portrait", "professionnel"];
       }
-    } else {
-      desiredTags = ["visage", "portrait", "professionnel"];
     }
+    
+    console.log(`🔍 Tags désirés pour la sélection: ${desiredTags.join(", ")}`);
 
     // 2. Récupérer toutes les images de l'utilisateur avec leurs tags
     const imagesSnapshot = await db.collection("images").where("email", "==", userEmail).get();
